@@ -20,33 +20,81 @@ DATABASES_DIR = "databases"
 @st.cache_resource
 def load_models():
     try:
-        # TinyLlama for all tasks (more efficient)
+        # Simplified model loading without device_map
         tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
         model = AutoModelForCausalLM.from_pretrained(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            torch_dtype=torch.float16,
-            device_map="auto"
+            torch_dtype=torch.float16
         )
+        
+        # Move model to GPU if available, otherwise CPU
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
         
         return {
             "clasificador": pipeline(
                 "text-classification",
                 model="distilbert-base-uncased",
-                device="cpu"
+                device=device
             ),
             "predictor": pipeline(
                 "text-generation",
                 model=model,
                 tokenizer=tokenizer,
-                device="cuda" if torch.cuda.is_available() else "cpu",
+                device=device,
                 torch_dtype=torch.float16,
                 max_length=200
             )
         }
     except Exception as e:
-        logging.error(f"Model loading error: {str(e)}")
-        st.error("Failed to load AI models. Some features may be limited.")
+        st.error(f"Error loading models: {str(e)}")
         return {"clasificador": None, "predictor": None}
+Fix 3: Robust Demand Prediction
+Update your predecir_demanda function:
+
+python
+def predecir_demanda(producto: str, tenant_id: str, modelos: dict) -> str:
+    try:
+        conn = get_db(tenant_id)
+        df = pd.read_sql("""
+            SELECT cantidad 
+            FROM movimientos 
+            WHERE producto_id IN (SELECT id FROM productos WHERE nombre=?)
+            ORDER BY fecha DESC LIMIT 6
+        """, conn, params=(producto,))
+        
+        # Handle empty/invalid data
+        if df.empty or df['cantidad'].isnull().all():
+            return "Comprar 5 unidades (sin datos históricos)"
+            
+        avg = df['cantidad'].mean()
+        if pd.isna(avg):
+            return "Comprar 5 unidades (datos inválidos)"
+            
+        if len(df) < 2 or modelos["predictor"] is None:
+            return f"Comprar {max(5, int(avg * 1.1))} unidades (regla básica)"
+        
+        # AI prediction with error handling
+        try:
+            prompt = f"""Predice demanda para {producto}:
+            - Promedio: {avg:.0f} unidades/mes
+            - Mes: {datetime.now().month}
+            - Temporada: {"alta" if datetime.now().month in [6,7,12] else "baja"}
+            
+            Respuesta: "Comprar X unidades [RAZÓN]"
+            """
+            
+            output = modelos["predictor"](
+                prompt,
+                max_new_tokens=100,
+                temperature=0.7
+            )
+            return output[0]["generated_text"].split("\n")[0]
+        except:
+            return f"Comprar {max(5, int(avg * 1.1))} unidades (fallback)"
+            
+    except Exception as e:
+        return "Comprar 5 unidades (error en predicción)"
 
 # --- Database Functions ---
 def get_db(tenant_id: str) -> sqlite3.Connection:
